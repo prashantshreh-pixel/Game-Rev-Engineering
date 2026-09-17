@@ -1,3 +1,5 @@
+import os
+import uuid
 import struct
 import hashlib
 from pathlib import Path
@@ -19,19 +21,16 @@ class SL2Slot:
 
 class SL2Container:
     """
-    Reverse-Engineered FromSoftware BND4 Save Container Engine (Sekiro, Dark Souls, Elden Ring).
-    
-    Architecture:
-    - BND4 Container Header with 12 packed save slots (USER_DATA000 .. USER_DATA011).
-    - Each slot consists of:
-      * 16-byte MD5 Checksum header (e.g. at offset 0x0300, 0x100310, etc.)
-      * Slot Payload (e.g. 1,048,576 bytes / 1 MB of save state).
-    - If any byte inside the payload is modified (by a hex editor or cheat),
-      the game computes MD5(payload) and displays 'Save Data is Corrupted' unless
-      the 16-byte checksum header is recalculated and patched.
+    Reverse-Engineered FromSoftware BND4 Save Container Engine.
+    Hardened with strict bounds validation on all untrusted header values:
+    - BND4 magic check
+    - File count upper and lower bounds (1..64)
+    - Record table bounds check
+    - Slot payload bounds validation
     """
 
     MAGIC = b"BND4"
+    MAX_SLOTS = 64
 
     def __init__(self, file_path: Union[str, Path]):
         self.file_path = Path(file_path).resolve()
@@ -43,17 +42,25 @@ class SL2Container:
     def is_sl2_file(cls, path_or_bytes: Union[str, Path, bytes]) -> bool:
         if isinstance(path_or_bytes, (str, Path)):
             p = Path(path_or_bytes)
-            if not p.exists() or p.stat().st_size < 0x300:
+            if not p.exists() or p.stat().st_size < 0x40:
                 return False
             with open(p, "rb") as f:
                 return f.read(4) == cls.MAGIC
         return bytes(path_or_bytes[:4]) == cls.MAGIC
 
     def _parse(self) -> None:
-        if len(self.data) < 0x40 or self.data[:4] != self.MAGIC:
-            raise ValueError(f"Invalid BND4 header in {self.file_path.name}")
+        file_len = len(self.data)
+        if file_len < 0x40 or self.data[:4] != self.MAGIC:
+            raise ValueError(f"Invalid or truncated BND4 header in {self.file_path.name}")
 
         file_count = struct.unpack_from("<I", self.data, 0x0C)[0]
+        if file_count <= 0 or file_count > self.MAX_SLOTS:
+            raise ValueError(f"Corrupted BND4 header: invalid slot count {file_count} (expected 1..{self.MAX_SLOTS})")
+
+        header_table_size = file_count * 0x20
+        if 0x40 + header_table_size > file_len:
+            raise ValueError(f"Malformed BND4 container: record table exceeds file size ({0x40 + header_table_size} > {file_len})")
+
         self.slots.clear()
 
         offset = 0x40
@@ -63,9 +70,15 @@ class SL2Container:
             data_off = struct.unpack_from("<I", self.data, offset + 16)[0]
             name_off = struct.unpack_from("<I", self.data, offset + 20)[0]
 
-            name = self.data[name_off : name_off + 32].decode("utf-16le", errors="ignore").split("\x00")[0]
+            if data_off < 0 or data_off + size > file_len:
+                raise ValueError(f"Slot {i} data span [0x{data_off:X}..0x{data_off + size:X}] exceeds file size {file_len}")
+            if size < 16:
+                raise ValueError(f"Slot {i} size {size} is too small to contain 16-byte checksum header.")
+            if name_off < 0 or name_off + 32 > file_len:
+                name = f"SLOT_{i:02d}"
+            else:
+                name = self.data[name_off : name_off + 32].decode("utf-16le", errors="ignore").split("\x00")[0]
 
-            # 16-byte MD5 Checksum at start of slot
             chk_offset = data_off
             payload_off = data_off + 16
             payload_size = size - 16
@@ -90,15 +103,10 @@ class SL2Container:
             offset += 0x20
 
     def verify_all(self) -> bool:
-        """Returns True if all slots have valid MD5 checksums."""
         self._parse()
         return all(s.is_valid for s in self.slots)
 
     def recalculate_and_patch_checksums(self) -> int:
-        """
-        Calculates and updates the 16-byte MD5 checksum for every slot.
-        Returns the number of slots patched.
-        """
         patched_count = 0
         for slot in self.slots:
             new_hash = hashlib.md5(self.data[slot.payload_offset : slot.payload_offset + slot.payload_size]).digest()
@@ -110,23 +118,20 @@ class SL2Container:
         self._parse()
         return patched_count
 
-    def patch_bytes(self, absolute_offset: int, new_bytes: bytes, auto_recalculate: bool = True) -> None:
-        """Writes bytes at offset and automatically updates the affected slot's checksum."""
-        self.data[absolute_offset : absolute_offset + len(new_bytes)] = new_bytes
-        if auto_recalculate:
-            self.recalculate_and_patch_checksums()
-
     def save(self, output_path: Optional[Union[str, Path]] = None, auto_recalculate: bool = True) -> Path:
-        """Recalculates all MD5 slot checksums and atomically writes to file."""
         if auto_recalculate:
             self.recalculate_and_patch_checksums()
 
         target = Path(output_path).resolve() if output_path else self.file_path
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        temp_file = target.with_name(f".tmp_{target.name}")
+        unique_id = uuid.uuid4().hex
+        temp_file = target.with_name(f".tmp_{unique_id}_{target.name}")
         try:
-            temp_file.write_bytes(self.data)
+            with open(temp_file, "wb") as f:
+                f.write(self.data)
+                f.flush()
+                os.fsync(f.fileno())
             temp_file.replace(target)
         finally:
             if temp_file.exists():

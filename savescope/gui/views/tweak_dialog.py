@@ -12,10 +12,12 @@ from savescope.models.game import SaveSlot
 from savescope.core.backup import BackupManager
 from savescope.core.sl2 import SL2Container
 from savescope.gui.widgets.hex_grid import HexViewerWidget
+from savescope.gui.views.sekiro_studio import SekiroStudioWidget
 
 class SaveTweakDialog(QDialog):
     """
     Intelligent Save Tweak Editor & FromSoftware SL2 Repair Suite:
+    - Sekiro Studio: Dedicated character stats, inventory manager, item spawner, and slot importer.
     - Text Mode: For JSON, XML, and INI configuration files with live formatting & search.
     - Hex Editor Mode: For binary save containers (.sl2, .dat, .bin) with offset navigation and in-place byte editing.
     - Automatic Checksum Engine: If an .sl2 FromSoftware save (Sekiro / Elden Ring) is detected,
@@ -29,9 +31,10 @@ class SaveTweakDialog(QDialog):
         self.game_name = game_name
         self.backup_mgr = BackupManager()
         self.sl2_container: SL2Container = None
+        self.sekiro_studio: SekiroStudioWidget = None
 
         self.setWindowTitle(f"SaveScope Tweak Editor — {game_name}: {slot.name}")
-        self.resize(1100, 720)
+        self.resize(1150, 760)
 
         layout = QVBoxLayout(self)
 
@@ -54,6 +57,18 @@ class SaveTweakDialog(QDialog):
 
         # Main Tabs
         self.tabs = QTabWidget()
+
+        # Check if this is a Sekiro save file
+        if self.sl2_container:
+            is_sekiro = (
+                "sekiro" in self.game_name.lower()
+                or "sekiro" in str(self.slot.path).lower()
+                or (len(self.sl2_container.slots) >= 1 and self.sl2_container.slots[0].payload_size == 0x100000)
+            )
+            if is_sekiro:
+                self.sekiro_studio = SekiroStudioWidget(self.sl2_container, parent=self)
+                self.sekiro_studio.dataChanged.connect(self._on_sekiro_studio_changed)
+                self.tabs.addTab(self.sekiro_studio, "🥷 Sekiro Character & Inventory Studio")
 
         # Tab: Interactive Hex Editor
         self.hex_widget = HexViewerWidget(editable=True)
@@ -92,6 +107,7 @@ class SaveTweakDialog(QDialog):
             self.tabs.addTab(self.hex_widget, "Interactive Hex Editor")
             self.tabs.addTab(self.text_widget, "Plain Text Preview")
 
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tabs)
 
         # Bottom Action Bar
@@ -210,6 +226,20 @@ class SaveTweakDialog(QDialog):
             self.editor.setTextCursor(cursor)
             self.editor.find(term)
 
+    def _on_tab_changed(self, index: int):
+        current_widget = self.tabs.widget(index)
+        if self.sekiro_studio and current_widget == self.sekiro_studio:
+            # Sync container data from hex widget if user edited in hex view
+            self.sl2_container.data = bytearray(self.hex_widget.current_bytes)
+            self.sekiro_studio._load_slot(self.sekiro_studio.current_slot_idx)
+        elif current_widget == self.hex_widget and self.sl2_container:
+            # Sync hex view from container data
+            self.hex_widget.load_bytes(self.sl2_container.data)
+
+    def _on_sekiro_studio_changed(self):
+        if self.sl2_container:
+            self.hex_widget.load_bytes(self.sl2_container.data)
+
     def _save_changes(self):
         try:
             # 1. Automatic pre-modification backup with SHA-256 verification
@@ -224,7 +254,7 @@ class SaveTweakDialog(QDialog):
                     except Exception as e:
                         reply = QMessageBox.question(
                             self, "JSON Syntax Warning",
-                            f"The JSON contains syntax errors:\\n{e}\\n\\nSave anyway?",
+                            f"The JSON contains syntax errors:\n{e}\n\nSave anyway?",
                             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                         )
                         if reply == QMessageBox.StandardButton.No:
@@ -232,19 +262,17 @@ class SaveTweakDialog(QDialog):
 
                 self.slot.path.write_text(content, encoding="utf-8")
             else:
-                # Binary save: extract bytes from hex widget
-                data_to_write = bytearray(self.hex_widget.current_bytes)
-
-                # If SL2 container, recalculate all MD5 checksum headers automatically!
+                # Binary save: if SL2 container, save via sl2_container with checksum patching
                 if self.sl2_container:
-                    self.sl2_container.data = data_to_write
-                    patched = self.sl2_container.recalculate_and_patch_checksums()
-                    data_to_write = self.sl2_container.data
-
-                # Atomic write
-                temp_file = self.slot.path.with_name(f".tmp_{self.slot.path.name}")
-                temp_file.write_bytes(data_to_write)
-                temp_file.replace(self.slot.path)
+                    # If current tab is hex widget, sync from hex widget first
+                    if self.tabs.currentWidget() == self.hex_widget:
+                        self.sl2_container.data = bytearray(self.hex_widget.current_bytes)
+                    self.sl2_container.save(output_path=self.slot.path, auto_recalculate=True)
+                else:
+                    data_to_write = bytearray(self.hex_widget.current_bytes)
+                    temp_file = self.slot.path.with_name(f".tmp_{self.slot.path.name}")
+                    temp_file.write_bytes(data_to_write)
+                    temp_file.replace(self.slot.path)
 
             self.status_lbl.setText(f"Saved & Verified! Backup at: {backup_path.name}")
             msg = f"Successfully saved changes to:\\n{self.slot.name}\\n\\nBackup created at:\\n{backup_path}"

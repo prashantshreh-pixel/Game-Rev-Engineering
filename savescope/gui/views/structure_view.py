@@ -1,18 +1,21 @@
+import os
+from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QComboBox
 )
 from PyQt6.QtCore import Qt
-from pathlib import Path
 
 from savescope.core.schema import SchemaManager
 from savescope.core.editor import SaveEditor
 from savescope.core.presets import PresetLibrary
 
+MAX_GUI_OPEN_SIZE = 150 * 1024 * 1024  # 150 MB safety cap
+
 class StructureView(QWidget):
     """
     Phase 5: Dynamic Structure & Value Editor.
-    Enforces schema safeguards and safe type conversions for all field values.
+    Hardened against unsafe schema bypass by forcing 'Save As Copy' when validation fails.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -49,7 +52,15 @@ class StructureView(QWidget):
         self.btn_save.clicked.connect(self._save_changes)
         top_bar.addWidget(self.btn_save)
 
+        self.btn_save_as = QPushButton("Save As Copy...")
+        self.btn_save_as.clicked.connect(self._save_as_copy)
+        top_bar.addWidget(self.btn_save_as)
+
         layout.addLayout(top_bar)
+
+        self.mode_banner = QLabel("Ready")
+        self.mode_banner.setStyleSheet("color: #888888; font-size: 11px; padding: 2px 4px;")
+        layout.addWidget(self.mode_banner)
 
         # Field table
         self.table = QTableWidget()
@@ -68,6 +79,11 @@ class StructureView(QWidget):
         if not fpath:
             return
 
+        p = Path(fpath)
+        if p.stat().st_size > MAX_GUI_OPEN_SIZE:
+            QMessageBox.critical(self, "File Too Large", f"Selected file ({p.stat().st_size / 1048576:.1f} MB) exceeds maximum allowed size (150 MB).")
+            return
+
         schema_name = self.schema_select.currentText()
         schema = self.schema_mgr.get_schema(schema_name)
         if not schema:
@@ -76,15 +92,23 @@ class StructureView(QWidget):
 
         try:
             self.editor = SaveEditor(fpath, schema, enforce_schema_guards=True)
+            self.mode_banner.setText(f"Loaded: {p.name} (Schema: {schema.name}) — Verified Integrity")
+            self.mode_banner.setStyleSheet("color: #55ff55; font-weight: bold;")
+            self.btn_save.setEnabled(True)
             self._refresh_table()
         except ValueError as e:
             reply = QMessageBox.question(
-                self, "Schema Integrity Warning",
-                f"File failed schema validation:\n{e}\n\nDo you want to ignore validation and load anyway?",
+                self, "Schema Integrity Mismatch",
+                f"File failed schema validation:\n{e}\n\n"
+                "Would you like to open in UNSAFE COPY-ONLY mode?\n"
+                "(Direct overwrites will be disabled to protect your original save. You may only 'Save As Copy'.)",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.editor = SaveEditor(fpath, schema, enforce_schema_guards=False)
+                self.mode_banner.setText(f"UNSAFE COPY-ONLY MODE: {p.name} (Direct overwrite forbidden)")
+                self.mode_banner.setStyleSheet("color: #ff5555; font-weight: bold;")
+                self.btn_save.setEnabled(False)  # Disable direct overwrite
                 self._refresh_table()
 
     def _refresh_table(self):
@@ -133,7 +157,7 @@ class StructureView(QWidget):
             preset = self.presets[idx]
             self.editor.apply_preset(preset)
             self._refresh_table()
-            QMessageBox.information(self, "Preset Applied", f"Preset '{preset.name}' successfully applied to buffer!")
+            QMessageBox.information(self, "Preset Applied", f"Preset '{preset.name}' applied to buffer!")
 
     def _save_changes(self):
         if not self.editor:
@@ -142,4 +166,16 @@ class StructureView(QWidget):
             saved_path = self.editor.save(auto_backup=True)
             QMessageBox.information(self, "Success", f"Changes saved! Rolling backup verified at:\n{saved_path}")
         except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Failed saving save file: {e}")
+            QMessageBox.critical(self, "Save Error", f"Failed saving file: {e}")
+
+    def _save_as_copy(self):
+        if not self.editor:
+            return
+        out_path, _ = QFileDialog.getSaveFileName(self, "Save As Copy", "", "Save Files (*.dat *.sav *.bin *.sl2);;All Files (*.*)")
+        if not out_path:
+            return
+        try:
+            saved_path = self.editor.save(destination=out_path, auto_backup=False)
+            QMessageBox.information(self, "Success", f"Successfully exported copy to:\n{saved_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed exporting copy: {e}")

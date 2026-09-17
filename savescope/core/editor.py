@@ -1,4 +1,5 @@
 import os
+import uuid
 import struct
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -9,6 +10,17 @@ from savescope.core.backup import BackupManager
 from savescope.core.presets import SavePreset
 from savescope.utils.checksum import compute_crc32, compute_adler32
 
+INTRINSIC_RANGES = {
+    DataType.UINT8: (0, 255),
+    DataType.INT8: (-128, 127),
+    DataType.UINT16: (0, 65535),
+    DataType.INT16: (-32768, 32767),
+    DataType.UINT32: (0, 4294967295),
+    DataType.INT32: (-2147483648, 2147483647),
+    DataType.UINT64: (0, 18446744073709551615),
+    DataType.INT64: (-9223372036854775808, 9223372036854775807),
+}
+
 class SaveEditor:
     """
     Phase 5: Production-Hardened Save Editor Engine.
@@ -16,9 +28,9 @@ class SaveEditor:
     - Expected file size verification
     - Magic bytes header checking
     - CRC32/Adler32 checksum verification and auto-recalculation
-    - Coercive type casting from UI strings to typed numerics/booleans/strings
-    - Automatic rolling backup before modification
-    - Atomic file saving via temporary file rename
+    - Intrinsic range limits enforced even when schema min/max are absent
+    - Exact length enforcement on bytes fields to avoid buffer resize
+    - Atomic file saving via unique temporary file flush + fsync + replace
     """
 
     def __init__(
@@ -31,22 +43,23 @@ class SaveEditor:
         self.file_path = Path(file_path).resolve()
         self.schema = schema
         self.backup_mgr = backup_mgr or BackupManager()
+        self.read_only_mode = False
         self._raw_data = bytearray(self.file_path.read_bytes())
         self._undo_stack: list[bytearray] = []
         self._redo_stack: list[bytearray] = []
 
         if enforce_schema_guards:
             self._validate_file_integrity()
+        else:
+            self.read_only_mode = True
 
     def _validate_file_integrity(self) -> None:
         """Enforces schema expected_size, magic_bytes, and checksum."""
-        # 1. Expected size check
         if self.schema.expected_size is not None and len(self._raw_data) != self.schema.expected_size:
             raise ValueError(
                 f"File size mismatch for {self.file_path.name}: expected {self.schema.expected_size} bytes, got {len(self._raw_data)} bytes."
             )
 
-        # 2. Magic bytes check
         if self.schema.magic_bytes:
             magic_len = len(self.schema.magic_bytes)
             start = self.schema.magic_offset
@@ -56,12 +69,10 @@ class SaveEditor:
                     f"Magic header mismatch at offset {start}: expected {self.schema.magic_bytes.hex()}, got {actual_magic.hex()}."
                 )
 
-        # 3. Checksum verification
         if self.schema.checksum_type and self.schema.checksum_offset is not None:
             self.verify_checksum()
 
     def verify_checksum(self) -> bool:
-        """Verifies embedded checksum matches buffer content."""
         if not self.schema.checksum_type or self.schema.checksum_offset is None:
             return True
 
@@ -69,7 +80,6 @@ class SaveEditor:
         reader = BinaryReader(self._raw_data)
         stored_cs = reader.read_u32(self.schema.checksum_offset, endian)
 
-        # Exclude checksum bytes from calculation
         data_to_hash = bytearray(self._raw_data)
         data_to_hash[self.schema.checksum_offset : self.schema.checksum_offset + 4] = b"\x00\x00\x00\x00"
 
@@ -85,7 +95,6 @@ class SaveEditor:
         return True
 
     def recalculate_checksum(self) -> None:
-        """Recalculates and embeds updated checksum in buffer."""
         if not self.schema.checksum_type or self.schema.checksum_offset is None:
             return
 
@@ -155,25 +164,18 @@ class SaveEditor:
         return None
 
     def set_value(self, field_key: str, raw_val: Any) -> list[str]:
-        """
-        Safely casts, validates, and sets a field value.
-        Converts text input (e.g. from GUI) into typed numerics/booleans.
-        """
         field = self._find_field(field_key)
         if not field:
             raise KeyError(f"Field '{field_key}' not found in schema.")
 
-        # Robust Type Coercion
         typed_val, cast_err = self._coerce_type(field, raw_val)
         if cast_err:
             return [cast_err]
 
-        # Bounds validation
         val_errors = self._validate_field_val(field, typed_val)
         if val_errors:
             return val_errors
 
-        # Save snapshot for undo
         self._undo_stack.append(bytearray(self._raw_data))
         self._redo_stack.clear()
 
@@ -205,16 +207,14 @@ class SaveEditor:
         elif field.data_type == DataType.STRING:
             writer.write_string(field.offset, typed_val, field.length or 16, field.encoding)
         elif field.data_type == DataType.BYTES:
-            writer.write_bytes(field.offset, typed_val)
+            writer.write_bytes(field.offset, typed_val, expected_len=field.length or 1)
 
-        # Recalculate checksum if enabled
         if self.schema.checksum_type:
             self.recalculate_checksum()
 
         return []
 
     def _coerce_type(self, field: FieldDefinition, val: Any) -> tuple[Any, Optional[str]]:
-        """Converts user or UI inputs (e.g. string) to the target schema type."""
         try:
             if field.data_type in (
                 DataType.INT8, DataType.UINT8, DataType.INT16, DataType.UINT16,
@@ -286,21 +286,36 @@ class SaveEditor:
         self._raw_data = self._redo_stack.pop()
         return True
 
-    def save(self, auto_backup: bool = True) -> Path:
-        """Creates a rolling backup and atomically writes changes to disk."""
-        if auto_backup and self.file_path.exists():
-            self.backup_mgr.create_backup(self.file_path, tag="pre_edit")
+    def save(self, destination: Optional[Union[str, Path]] = None, auto_backup: bool = True) -> Path:
+        """
+        Atomically saves buffer to disk using a unique UUID temporary file with fsync flush.
+        If the editor is in read_only_mode (validation bypassed), direct overwrite is forbidden.
+        """
+        target_path = Path(destination).resolve() if destination else self.file_path
 
-        # Atomic File Write using temporary file on same directory
-        temp_file = self.file_path.with_name(f".tmp_{self.file_path.name}_{os.getpid()}")
+        if self.read_only_mode and target_path == self.file_path:
+            raise PermissionError(
+                "Save rejected: File was opened with schema validation bypassed (Unsafe Mode). "
+                "Direct overwrite is forbidden. Please use 'Save As Copy' to a new file path."
+            )
+
+        if auto_backup and target_path.exists():
+            self.backup_mgr.create_backup(target_path, tag="pre_edit")
+
+        # Unique temp file with fsync flush
+        unique_id = uuid.uuid4().hex
+        temp_file = target_path.with_name(f".tmp_{unique_id}_{target_path.name}")
         try:
-            temp_file.write_bytes(self._raw_data)
-            temp_file.replace(self.file_path)
+            with open(temp_file, "wb") as f:
+                f.write(self._raw_data)
+                f.flush()
+                os.fsync(f.fileno())
+            temp_file.replace(target_path)
         finally:
             if temp_file.exists():
                 temp_file.unlink()
 
-        return self.file_path
+        return target_path
 
     def _find_field(self, key: str) -> Optional[FieldDefinition]:
         for f in self.schema.fields:
@@ -310,8 +325,22 @@ class SaveEditor:
 
     def _validate_field_val(self, field: FieldDefinition, val: Any) -> list[str]:
         errors = []
+        # 1. Intrinsic numeric bounds
+        if field.data_type in INTRINSIC_RANGES:
+            min_lim, max_lim = INTRINSIC_RANGES[field.data_type]
+            if val < min_lim or val > max_lim:
+                errors.append(f"{field.key}: value {val} out of intrinsic {field.data_type.value} range [{min_lim}, {max_lim}].")
+
+        # 2. Exact length check for DataType.BYTES
+        if field.data_type == DataType.BYTES:
+            expected_len = field.length or 1
+            if len(val) != expected_len:
+                errors.append(f"{field.key}: bytes length must be exactly {expected_len}, got {len(val)}.")
+
+        # 3. Schema range limits
         if field.min_value is not None and val < field.min_value:
-            errors.append(f"{field.key}: value {val} is below minimum {field.min_value}")
+            errors.append(f"{field.key}: value {val} is below schema minimum {field.min_value}")
         if field.max_value is not None and val > field.max_value:
-            errors.append(f"{field.key}: value {val} exceeds maximum {field.max_value}")
+            errors.append(f"{field.key}: value {val} exceeds schema maximum {field.max_value}")
+
         return errors

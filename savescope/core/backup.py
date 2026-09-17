@@ -1,7 +1,7 @@
 import os
 import shutil
 import time
-import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional, Union
 from savescope.utils.checksum import compute_sha256
@@ -9,8 +9,8 @@ from savescope.utils.checksum import compute_sha256
 class BackupManager:
     """
     Phase 7: Rolling Backup & Rollback Manager.
-    Automatically snapshots save files before modifications, maintaining
-    timestamped versions, SHA-256 integrity verification on restore, and atomic rollbacks.
+    Snapshots save files with unique UUIDs, SHA-256 verification on restore,
+    and atomic replacement with fsync flush.
     """
 
     def __init__(self, backup_root: Optional[Union[str, Path]] = None):
@@ -27,16 +27,16 @@ class BackupManager:
 
         game_folder = source.parent.name
         timestamp = time.strftime("%Y%m%d_%H%M%S")
+        unique_suffix = uuid.uuid4().hex[:8]
         target_dir = self.backup_root / game_folder
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        backup_name = f"{source.stem}_{timestamp}_{tag}{source.suffix}"
+        backup_name = f"{source.stem}_{timestamp}_{unique_suffix}_{tag}{source.suffix}"
         target_path = target_dir / backup_name
 
         data = source.read_bytes()
         target_path.write_bytes(data)
 
-        # Write metadata sidecar (.meta)
         meta_path = target_path.with_suffix(".meta")
         meta_content = (
             f"original_path: {source}\n"
@@ -59,7 +59,6 @@ class BackupManager:
                     for line in meta_file.read_text(encoding="utf-8").splitlines()
                     if ": " in line
                 )
-                backup_bin = meta_file.with_suffix("")
                 matches = list(meta_file.parent.glob(f"{meta_file.stem}.*"))
                 actual_backup = [m for m in matches if m.suffix != ".meta"]
                 backup_bin = actual_backup[0] if actual_backup else None
@@ -84,11 +83,6 @@ class BackupManager:
     def restore_backup(
         self, backup_path: Union[str, Path], destination: Optional[Union[str, Path]] = None, verify_sha256: bool = True
     ) -> Path:
-        """
-        Restores a backup to its original path or destination.
-        Strictly verifies SHA-256 checksum from .meta sidecar before restoring
-        and writes destination atomically using temporary file replacement.
-        """
         b_path = Path(backup_path).resolve()
         if not b_path.exists():
             raise FileNotFoundError(f"Backup file not found: {b_path}")
@@ -110,7 +104,6 @@ class BackupManager:
         if not target_path:
             raise ValueError("No destination specified and original_path not found in metadata.")
 
-        # SHA-256 Integrity Verification
         actual_hash = compute_sha256(b_path.read_bytes())
         if verify_sha256 and expected_hash:
             if actual_hash.lower() != expected_hash.lower():
@@ -120,10 +113,12 @@ class BackupManager:
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Atomic replacement: write to temp file on same volume then replace
-        temp_file = target_path.with_name(f".tmp_{target_path.name}_{os.getpid()}")
+        temp_file = target_path.with_name(f".tmp_{uuid.uuid4().hex}_{target_path.name}")
         try:
-            shutil.copy2(b_path, temp_file)
+            with open(b_path, "rb") as src, open(temp_file, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+                dst.flush()
+                os.fsync(dst.fileno())
             temp_file.replace(target_path)
         finally:
             if temp_file.exists():

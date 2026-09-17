@@ -1,0 +1,40 @@
+{
+  "name": "Sekiro: Shadows Die Twice",
+  "version": "1.0",
+  "game_name": "Sekiro",
+  "endianness": "little",
+  "expected_size": null,
+  "magic_hex": "424e4434",
+  "magic_offset": 0,
+  "checksum_type": null,
+  "checksum_offset": null,
+  "fields": [
+    {
+      "key": "sen_gold",
+      "offset": 160,
+      "type": "uint32",
+      "category": "Economy",
+      "description": "Sen / Coins held by Wolf",
+      "min": 0,
+      "max": 999999
+    },
+    {
+      "key": "skill_points",
+      "offset": 164,
+      "type": "uint16",
+      "category": "Character",
+      "description": "Current available skill points",
+      "min": 0,
+      "max": 99
+    },
+    {
+      "key": "resurrection_charges",
+      "offset": 166,
+      "type": "uint8",
+      "category": "Character",
+      "description": "Resurrection nodes available",
+      "min": 0,
+      "max": 3
+    }
+  ]
+}
